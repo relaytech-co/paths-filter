@@ -1,5 +1,55 @@
 # Paths Changes Filter
 
+## Relay fork
+
+This is Relay's fork of [dorny/paths-filter](https://github.com/dorny/paths-filter). It adds a `merge-base` input: on a pull request with `token: ''`, `merge-base: true` diffs from the merge-base of `base` and the checked-out commit, rather than from `base`'s tip, so commits that landed on `base` after the pull request forked from it do not count as its changes. See `merge-base` under [Usage](#usage).
+
+```yaml
+- uses: actions/checkout@v5
+- uses: relaytech-co/paths-filter@v1
+  with:
+    base: dev
+    token: ''
+    merge-base: true
+    filters: |
+      ...
+```
+
+### Versions
+
+The fork has its own version line, separate from upstream's: `v1.0.0` is upstream `v4.0.3` plus `merge-base`. A patch release merges a newer upstream release, a minor release adds an input or changes one compatibly, and a major release breaks one.
+
+`v1` is a moving tag on the latest `v1.x.y` release, so a workflow that uses `@v1` runs each new release from its next run, with no change on its side. Every `v1.x.y` release moves it, and a breaking change starts `v2` instead.
+
+### Releasing
+
+`dist/index.js` is what the action runs, so it is committed, and every source change has to rebuild it:
+
+```bash
+npm ci
+npm run all
+```
+
+Once the change is on `master`, tag the release and move `v1` to it:
+
+```bash
+sha=$(gh api repos/relaytech-co/paths-filter/commits/master --jq .sha)
+gh release create v1.0.1 --repo relaytech-co/paths-filter --target "$sha" --title v1.0.1 --notes "..."
+gh api -X PATCH repos/relaytech-co/paths-filter/git/refs/tags/v1 -f sha="$sha" -F force=true
+```
+
+### Merging upstream
+
+Merge an upstream release tag rather than upstream's `master`, so that each release of the fork is based on a release of upstream. Resolve a conflict in `dist/` by rebuilding it, then release as above:
+
+```bash
+git remote add upstream https://github.com/dorny/paths-filter.git
+git fetch --no-tags upstream refs/tags/v4.0.4:refs/upstream-tags/v4.0.4
+git merge refs/upstream-tags/v4.0.4
+```
+
+Fetching the tag under `refs/upstream-tags/` rather than `refs/tags/` keeps upstream's `v4.x.y` tags out of this repository, because otherwise a `git push --tags` would publish them next to the fork's own versions.
+
 [GitHub Action](https://github.com/features/actions) that enables conditional execution of workflow steps and jobs, based on the files modified by pull request, on a feature
 branch, or by the recently pushed commits.
 
