@@ -176,6 +176,17 @@ For more information, see [CHANGELOG](https://github.com/dorny/paths-filter/blob
     # Default: ${{ github.token }}
     token: ''
 
+    # On pull request events with token: '', detect the changes made since the
+    # pull request forked from 'base', by diffing from the merge-base of 'base'
+    # and the checked-out commit, rather than diffing 'base' itself against it.
+    # Commits that landed on 'base' after the fork are then not counted as changes,
+    # and for a stacked pull request with base: <trunk>, every pull request below
+    # it in the stack is. 'base' is always fetched from origin, rather than taken
+    # from a local ref that a runner keeping .git between jobs may have left stale,
+    # and history is deepened until the merge-base is found.
+    # Default: false
+    merge-base: 'false'
+
     # Optional parameter to override the default behavior of file matching algorithm.
     # Supported values:
     #   'some'               - File is included if it matches at least one pattern (default).

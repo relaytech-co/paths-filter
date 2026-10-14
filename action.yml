@@ -20,6 +20,15 @@ inputs:
       If it references same branch it was pushed to, changes are detected against the most recent commit before the push.
       This option is ignored if action is triggered by pull_request event.
     required: false
+  merge-base:
+    description: |
+      When 'true', a pull_request event with token: '' detects the changes made since the pull request forked from 'base',
+      by diffing from the merge-base of 'base' and the checked-out commit, rather than diffing 'base' itself against it.
+      Commits that landed on 'base' after the fork are then not counted as changes.
+      'base' is always fetched from origin, and history is deepened until the merge-base is found.
+      This option is ignored unless the action is triggered by pull_request event and 'token' is empty.
+    required: false
+    default: 'false'
   filters:
     description: 'Path to the configuration file or YAML string with filters definition'
     required: true
