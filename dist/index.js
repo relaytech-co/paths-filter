@@ -250,7 +250,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isGitSha = exports.getShortName = exports.getCurrentRef = exports.listAllFilesAsAdded = exports.parseGitDiffOutput = exports.getChangesSinceMergeBase = exports.getChangesOnHead = exports.getChanges = exports.getChangesInLastCommit = exports.gitExec = exports.HEAD = exports.NULL_SHA = void 0;
+exports.isGitSha = exports.getShortName = exports.getCurrentRef = exports.listAllFilesAsAdded = exports.parseGitDiffOutput = exports.getChangesSinceMergeBase = exports.getChangesOnHead = exports.getChangesFromMergeBase = exports.getChanges = exports.getChangesInLastCommit = exports.gitExec = exports.HEAD = exports.NULL_SHA = void 0;
 const exec_1 = __nccwpck_require__(1514);
 const core = __importStar(__nccwpck_require__(2186));
 const file_1 = __nccwpck_require__(4014);
@@ -315,6 +315,79 @@ async function getChanges(base, head) {
     return parseGitDiffOutput(output);
 }
 exports.getChanges = getChanges;
+// Changes on head since it forked from base: the diff from their merge-base, so commits that
+// landed on base after the fork are not counted as changes.
+// Base is fetched from origin on every call rather than taken from a local ref, because a runner
+// that keeps .git between jobs would otherwise find a stale base and a stale merge-base with it
+// (see https://github.com/dorny/paths-filter/issues/329). Both tips are then deepened by SHA,
+// because a fetch by ref name skips a ref that is already up to date and so deepens nothing.
+async function getChangesFromMergeBase(base, head, initialFetchDepth) {
+    let baseSha;
+    let headSha;
+    let mergeBase;
+    core.startGroup(`Searching for merge-base of ${base} and ${head}`);
+    try {
+        const shallow = await isShallowRepository();
+        headSha = await fetchCommit(head, shallow, initialFetchDepth, false);
+        baseSha = await fetchCommit(base, shallow, initialFetchDepth, true);
+        mergeBase = await findMergeBase(baseSha, headSha);
+        let depth = initialFetchDepth;
+        let lastCommitCount = await getCommitCount([baseSha, headSha]);
+        while (mergeBase === undefined && shallow) {
+            depth = Math.min(depth * 2, Number.MAX_SAFE_INTEGER);
+            await gitExec(['fetch', '--no-tags', `--deepen=${depth}`, 'origin', baseSha, headSha]);
+            mergeBase = await findMergeBase(baseSha, headSha);
+            const commitCount = await getCommitCount([baseSha, headSha]);
+            if (commitCount === lastCommitCount) {
+                break;
+            }
+            lastCommitCount = commitCount;
+        }
+    }
+    finally {
+        core.endGroup();
+    }
+    let diffArg = `${mergeBase}..${headSha}`;
+    if (mergeBase === undefined) {
+        core.warning(`No merge-base of ${base} and ${head} found - change detection will use direct <commit>..<commit> comparison`);
+        diffArg = `${baseSha}..${headSha}`;
+    }
+    else {
+        core.info(`Merge-base of ${base} and ${head} is ${mergeBase}`);
+    }
+    core.startGroup(`Change detection ${diffArg}`);
+    let output = '';
+    try {
+        output = (await gitExec(['diff', '--no-renames', '--name-status', '-z', diffArg])).stdout;
+    }
+    finally {
+        fixStdOutNullTermination();
+        core.endGroup();
+    }
+    return parseGitDiffOutput(output);
+}
+exports.getChangesFromMergeBase = getChangesFromMergeBase;
+async function isShallowRepository() {
+    return (await gitExec(['rev-parse', '--is-shallow-repository'])).stdout.trim() === 'true';
+}
+// The commit a ref names, fetched from origin when it is not available locally or when refresh is set.
+// A shallow repository fetches it at the initial depth; a complete one fetches without a depth, because
+// --depth would cut the history of the commits it brings in.
+async function fetchCommit(ref, shallow, initialFetchDepth, refresh) {
+    if (!refresh || isGitSha(ref)) {
+        const local = await gitExec(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { ignoreReturnCode: true });
+        if (local.exitCode === 0) {
+            return local.stdout.trim();
+        }
+    }
+    const depthArgs = shallow ? [`--depth=${initialFetchDepth}`] : [];
+    await gitExec(['fetch', '--no-tags', ...depthArgs, 'origin', ref]);
+    return (await gitExec(['rev-parse', '--verify', 'FETCH_HEAD^{commit}'])).stdout.trim();
+}
+async function findMergeBase(base, head) {
+    const result = await gitExec(['merge-base', base, head], { ignoreReturnCode: true });
+    return result.exitCode === 0 ? result.stdout.trim() : undefined;
+}
 async function getChangesOnHead() {
     // Get current changes - both staged and unstaged
     core.startGroup(`Change detection on HEAD`);
@@ -363,11 +436,12 @@ async function getChangesSinceMergeBase(base, head, initialFetchDepth) {
                 }
             }
             let depth = initialFetchDepth;
-            let lastCommitCount = await getCommitCount();
+            const countedRefs = [baseRef, headRef];
+            let lastCommitCount = await getCommitCount(countedRefs);
             while (!(await hasMergeBase())) {
                 depth = Math.min(depth * 2, Number.MAX_SAFE_INTEGER);
                 await gitExec(['fetch', `--deepen=${depth}`, 'origin', base, head]);
-                const commitCount = await getCommitCount();
+                const commitCount = await getCommitCount(countedRefs);
                 if (commitCount === lastCommitCount) {
                     core.info('No more commits were fetched');
                     core.info('Last attempt will be to fetch full history');
@@ -471,8 +545,11 @@ exports.isGitSha = isGitSha;
 async function hasCommit(ref) {
     return (await gitExec(['cat-file', '-e', `${ref}^{commit}`], { ignoreReturnCode: true })).exitCode === 0;
 }
-async function getCommitCount() {
-    const output = (await gitExec(['rev-list', '--count', '--all'])).stdout;
+// Counts commits reachable from the given refs only.
+// '--all' would also traverse unrelated refs, which fails the whole job when any of them
+// has a missing parent in a shallow clone - see https://github.com/dorny/paths-filter/issues/321
+async function getCommitCount(refs) {
+    const output = (await gitExec(['rev-list', '--count', ...refs])).stdout;
     const count = parseInt(output);
     return isNaN(count) ? 0 : count;
 }
@@ -650,6 +727,7 @@ async function run() {
         const listFiles = core.getInput('list-files', { required: false }).toLowerCase() || 'none';
         const initialFetchDepth = parseInt(core.getInput('initial-fetch-depth', { required: false })) || 10;
         const predicateQuantifier = core.getInput('predicate-quantifier', { required: false }) || filter_1.PredicateQuantifier.SOME;
+        const mergeBase = (core.getInput('merge-base', { required: false }) || 'false').toLowerCase() === 'true';
         if (!isExportFormat(listFiles)) {
             core.setFailed(`Input parameter 'list-files' is set to invalid value '${listFiles}'`);
             return;
@@ -661,7 +739,7 @@ async function run() {
         }
         const filterConfig = { predicateQuantifier };
         const filter = new filter_1.Filter(filtersYaml, filterConfig);
-        const files = await getChangedFiles(token, base, ref, initialFetchDepth);
+        const files = await getChangedFiles(token, base, ref, initialFetchDepth, mergeBase);
         core.info(`Detected ${files.length} changed files`);
         const results = filter.match(files);
         exportResults(results, listFiles);
@@ -685,7 +763,7 @@ function getConfigFileContent(configPath) {
     }
     return fs.readFileSync(configPath, { encoding: 'utf8' });
 }
-async function getChangedFiles(token, base, ref, initialFetchDepth) {
+async function getChangedFiles(token, base, ref, initialFetchDepth, mergeBase) {
     var _a, _b;
     // if base is 'HEAD' only local uncommitted changes will be detected
     // This is the simplest case as we don't need to fetch more commits or evaluate current/before refs
@@ -710,6 +788,9 @@ async function getChangedFiles(token, base, ref, initialFetchDepth) {
                 if (base) {
                     core.warning(`'base' input parameter is ignored when action is triggered by pull request event and 'token' is provided - set token: '' to detect changes using git diff against 'base'`);
                 }
+                if (mergeBase) {
+                    core.warning(`'merge-base' input parameter is ignored when action is triggered by pull request event and 'token' is provided - set token: '' to detect changes since the merge-base`);
+                }
                 return await getChangedFilesFromApi(token, pr);
             }
             if (github.context.eventName === 'pull_request_target') {
@@ -725,6 +806,9 @@ async function getChangedFiles(token, base, ref, initialFetchDepth) {
             const baseSha = (_a = github.context.payload.pull_request) === null || _a === void 0 ? void 0 : _a.base.sha;
             const defaultBranch = (_b = github.context.payload.repository) === null || _b === void 0 ? void 0 : _b.default_branch;
             const currentRef = await git.getCurrentRef();
+            if (mergeBase) {
+                return await git.getChangesFromMergeBase(base || baseSha || defaultBranch, currentRef, initialFetchDepth);
+            }
             return await git.getChanges(base || baseSha || defaultBranch, currentRef);
         }
         // To keep backward compatibility, manual inputs take precedence over

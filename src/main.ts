@@ -35,6 +35,7 @@ async function run(): Promise<void> {
     const listFiles = core.getInput('list-files', {required: false}).toLowerCase() || 'none'
     const initialFetchDepth = parseInt(core.getInput('initial-fetch-depth', {required: false})) || 10
     const predicateQuantifier = core.getInput('predicate-quantifier', {required: false}) || PredicateQuantifier.SOME
+    const mergeBase = (core.getInput('merge-base', {required: false}) || 'false').toLowerCase() === 'true'
 
     if (!isExportFormat(listFiles)) {
       core.setFailed(`Input parameter 'list-files' is set to invalid value '${listFiles}'`)
@@ -50,7 +51,7 @@ async function run(): Promise<void> {
     const filterConfig: FilterConfig = {predicateQuantifier}
 
     const filter = new Filter(filtersYaml, filterConfig)
-    const files = await getChangedFiles(token, base, ref, initialFetchDepth)
+    const files = await getChangedFiles(token, base, ref, initialFetchDepth, mergeBase)
     core.info(`Detected ${files.length} changed files`)
     const results = filter.match(files)
     exportResults(results, listFiles)
@@ -77,7 +78,13 @@ function getConfigFileContent(configPath: string): string {
   return fs.readFileSync(configPath, {encoding: 'utf8'})
 }
 
-async function getChangedFiles(token: string, base: string, ref: string, initialFetchDepth: number): Promise<File[]> {
+async function getChangedFiles(
+  token: string,
+  base: string,
+  ref: string,
+  initialFetchDepth: number,
+  mergeBase: boolean
+): Promise<File[]> {
   // if base is 'HEAD' only local uncommitted changes will be detected
   // This is the simplest case as we don't need to fetch more commits or evaluate current/before refs
   if (base === git.HEAD) {
@@ -104,6 +111,11 @@ async function getChangedFiles(token: string, base: string, ref: string, initial
             `'base' input parameter is ignored when action is triggered by pull request event and 'token' is provided - set token: '' to detect changes using git diff against 'base'`
           )
         }
+        if (mergeBase) {
+          core.warning(
+            `'merge-base' input parameter is ignored when action is triggered by pull request event and 'token' is provided - set token: '' to detect changes since the merge-base`
+          )
+        }
         return await getChangedFilesFromApi(token, pr)
       }
       if (github.context.eventName === 'pull_request_target') {
@@ -119,6 +131,9 @@ async function getChangedFiles(token: string, base: string, ref: string, initial
       const baseSha = github.context.payload.pull_request?.base.sha
       const defaultBranch = github.context.payload.repository?.default_branch
       const currentRef = await git.getCurrentRef()
+      if (mergeBase) {
+        return await git.getChangesFromMergeBase(base || baseSha || defaultBranch, currentRef, initialFetchDepth)
+      }
       return await git.getChanges(base || baseSha || defaultBranch, currentRef)
     }
     // To keep backward compatibility, manual inputs take precedence over

@@ -71,6 +71,91 @@ export async function getChanges(base: string, head: string): Promise<File[]> {
   return parseGitDiffOutput(output)
 }
 
+// Changes on head since it forked from base: the diff from their merge-base, so commits that
+// landed on base after the fork are not counted as changes.
+// Base is fetched from origin on every call rather than taken from a local ref, because a runner
+// that keeps .git between jobs would otherwise find a stale base and a stale merge-base with it
+// (see https://github.com/dorny/paths-filter/issues/329). Both tips are then deepened by SHA,
+// because a fetch by ref name skips a ref that is already up to date and so deepens nothing.
+export async function getChangesFromMergeBase(base: string, head: string, initialFetchDepth: number): Promise<File[]> {
+  let baseSha: string
+  let headSha: string
+  let mergeBase: string | undefined
+  core.startGroup(`Searching for merge-base of ${base} and ${head}`)
+  try {
+    const shallow = await isShallowRepository()
+    headSha = await fetchCommit(head, shallow, initialFetchDepth, false)
+    baseSha = await fetchCommit(base, shallow, initialFetchDepth, true)
+    mergeBase = await findMergeBase(baseSha, headSha)
+
+    let depth = initialFetchDepth
+    let lastCommitCount = await getCommitCount([baseSha, headSha])
+    while (mergeBase === undefined && shallow) {
+      depth = Math.min(depth * 2, Number.MAX_SAFE_INTEGER)
+      await gitExec(['fetch', '--no-tags', `--deepen=${depth}`, 'origin', baseSha, headSha])
+      mergeBase = await findMergeBase(baseSha, headSha)
+      const commitCount = await getCommitCount([baseSha, headSha])
+      if (commitCount === lastCommitCount) {
+        break
+      }
+      lastCommitCount = commitCount
+    }
+  } finally {
+    core.endGroup()
+  }
+
+  let diffArg = `${mergeBase}..${headSha}`
+  if (mergeBase === undefined) {
+    core.warning(
+      `No merge-base of ${base} and ${head} found - change detection will use direct <commit>..<commit> comparison`
+    )
+    diffArg = `${baseSha}..${headSha}`
+  } else {
+    core.info(`Merge-base of ${base} and ${head} is ${mergeBase}`)
+  }
+
+  core.startGroup(`Change detection ${diffArg}`)
+  let output = ''
+  try {
+    output = (await gitExec(['diff', '--no-renames', '--name-status', '-z', diffArg])).stdout
+  } finally {
+    fixStdOutNullTermination()
+    core.endGroup()
+  }
+
+  return parseGitDiffOutput(output)
+}
+
+async function isShallowRepository(): Promise<boolean> {
+  return (await gitExec(['rev-parse', '--is-shallow-repository'])).stdout.trim() === 'true'
+}
+
+// The commit a ref names, fetched from origin when it is not available locally or when refresh is set.
+// A shallow repository fetches it at the initial depth; a complete one fetches without a depth, because
+// --depth would cut the history of the commits it brings in.
+async function fetchCommit(
+  ref: string,
+  shallow: boolean,
+  initialFetchDepth: number,
+  refresh: boolean
+): Promise<string> {
+  if (!refresh || isGitSha(ref)) {
+    const local = await gitExec(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {ignoreReturnCode: true})
+    if (local.exitCode === 0) {
+      return local.stdout.trim()
+    }
+  }
+
+  const depthArgs = shallow ? [`--depth=${initialFetchDepth}`] : []
+  await gitExec(['fetch', '--no-tags', ...depthArgs, 'origin', ref])
+  return (await gitExec(['rev-parse', '--verify', 'FETCH_HEAD^{commit}'])).stdout.trim()
+}
+
+async function findMergeBase(base: string, head: string): Promise<string | undefined> {
+  const result = await gitExec(['merge-base', base, head], {ignoreReturnCode: true})
+  return result.exitCode === 0 ? result.stdout.trim() : undefined
+}
+
 export async function getChangesOnHead(): Promise<File[]> {
   // Get current changes - both staged and unstaged
   core.startGroup(`Change detection on HEAD`)
@@ -125,11 +210,12 @@ export async function getChangesSinceMergeBase(base: string, head: string, initi
       }
 
       let depth = initialFetchDepth
-      let lastCommitCount = await getCommitCount()
+      const countedRefs = [baseRef, headRef]
+      let lastCommitCount = await getCommitCount(countedRefs)
       while (!(await hasMergeBase())) {
         depth = Math.min(depth * 2, Number.MAX_SAFE_INTEGER)
         await gitExec(['fetch', `--deepen=${depth}`, 'origin', base, head])
-        const commitCount = await getCommitCount()
+        const commitCount = await getCommitCount(countedRefs)
         if (commitCount === lastCommitCount) {
           core.info('No more commits were fetched')
           core.info('Last attempt will be to fetch full history')
@@ -236,8 +322,11 @@ async function hasCommit(ref: string): Promise<boolean> {
   return (await gitExec(['cat-file', '-e', `${ref}^{commit}`], {ignoreReturnCode: true})).exitCode === 0
 }
 
-async function getCommitCount(): Promise<number> {
-  const output = (await gitExec(['rev-list', '--count', '--all'])).stdout
+// Counts commits reachable from the given refs only.
+// '--all' would also traverse unrelated refs, which fails the whole job when any of them
+// has a missing parent in a shallow clone - see https://github.com/dorny/paths-filter/issues/321
+async function getCommitCount(refs: string[]): Promise<number> {
+  const output = (await gitExec(['rev-list', '--count', ...refs])).stdout
   const count = parseInt(output)
   return isNaN(count) ? 0 : count
 }
